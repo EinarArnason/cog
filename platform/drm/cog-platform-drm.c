@@ -45,7 +45,18 @@ struct _CogDrmPlatformClass {
 
 struct _CogDrmPlatform {
     CogPlatform parent;
+    gboolean atomic_mode_setting;
+    float device_scale_factor;
 };
+
+enum {
+    PROP_0,
+    PROP_ATOMIC_MODE_SETTING,
+    PROP_DEVICE_SCALE_FACTOR,
+    N_PROPERTIES,
+};
+
+static GParamSpec *s_properties[N_PROPERTIES] = { NULL, };
 
 G_DECLARE_FINAL_TYPE(CogDrmPlatform, cog_drm_platform, COG, DRM_PLATFORM, CogPlatform)
 
@@ -99,9 +110,7 @@ static struct {
 
     uint32_t width;
     uint32_t height;
-    double device_scale;
 
-    bool atomic_modesetting;
     bool mode_set;
     struct wl_list buffer_list;
     struct buffer_object *committed_buffer;
@@ -119,8 +128,6 @@ static struct {
     .encoder = NULL,
     .width = 0,
     .height = 0,
-    .device_scale = 1.0,
-    .atomic_modesetting = true,
     .mode_set = false,
     .committed_buffer = NULL,
 };
@@ -198,43 +205,23 @@ static struct {
     struct wpe_view_backend *backend;
 } wpe_view_data;
 
-
 static void
-init_config (CogShell *shell)
+init_config(CogDrmPlatform *self, CogShell *shell)
 {
-    drm_data.device_scale = cog_shell_get_device_scale_factor (shell);
-    g_debug ("init_config: overriding device_scale value, using %.2f from shell",
-             drm_data.device_scale);
-
     GKeyFile *key_file = cog_shell_get_config_file (shell);
-    if (!key_file)
-        return;
-
-    {
-        g_autoptr(GError) lookup_error = NULL;
-        gboolean value = g_key_file_get_boolean (key_file,
-                                                 "drm", "disable-atomic-modesetting",
-                                                 &lookup_error);
-        if (!lookup_error) {
-            drm_data.atomic_modesetting = !value;
-            g_debug ("init_config: atomic modesetting reconfigured to value '%s'",
-                     drm_data.atomic_modesetting ? "true" : "false");
-        }
+    if (key_file) {
+        g_autoptr(GError) error = NULL;
+        if (!cog_apply_properties_from_key_file(G_OBJECT(self), key_file, "drm", &error))
+            g_warning("Reading config file: %s", error->message);
     }
 
-    {
-        g_autoptr(GError) lookup_error = NULL;
-        gdouble value = g_key_file_get_double (key_file,
-                                               "drm", "device-scale-factor",
-                                               &lookup_error);
-        if (!lookup_error) {
-            drm_data.device_scale = value;
-            g_debug ("init_config:overriding device_scale value, using %.2f from config",
-                     drm_data.device_scale);
-        }
+    float device_scale_factor = cog_shell_get_device_scale_factor(shell);
+    if (device_scale_factor >= 0.2f) {
+        g_debug("%s: Overriding CogDrmPlatform<%p>.device-scale-factor = <%.2f> from shell",
+                __func__, self, device_scale_factor);
+        self->device_scale_factor = device_scale_factor;
     }
 }
-
 
 static void
 destroy_buffer (struct buffer_object *buffer)
@@ -347,7 +334,7 @@ check_drm(void)
 }
 
 static gboolean
-init_drm(void)
+init_drm(CogDrmPlatform *self)
 {
     drmDevice *devices[64];
     memset(devices, 0, sizeof(*devices) * 64);
@@ -392,10 +379,10 @@ init_drm(void)
     if (!drm_data.base_resources)
         return FALSE;
 
-    if (drm_data.atomic_modesetting) {
+    if (self->atomic_mode_setting) {
         int ret = drmSetClientCap (drm_data.fd, DRM_CLIENT_CAP_ATOMIC, 1);
         if (ret) {
-            drm_data.atomic_modesetting = false;
+            self->atomic_mode_setting = FALSE;
             g_debug ("init_drm: atomic mode not usable, falling back to non-atomic mode");
         }
     }
@@ -952,14 +939,14 @@ drm_commit_buffer_atomic (struct buffer_object *buffer)
     return 0;
 }
 
-static void
-drm_commit_buffer (struct buffer_object *buffer)
+static inline void
+drm_commit_buffer(CogDrmPlatform *self, struct buffer_object *buffer)
 {
     int ret;
-    if (drm_data.atomic_modesetting)
-        ret = drm_commit_buffer_atomic (buffer);
+    if (self->atomic_mode_setting)
+        ret = drm_commit_buffer_atomic(buffer);
     else
-        ret = drm_commit_buffer_nonatomic (buffer);
+        ret = drm_commit_buffer_nonatomic(buffer);
 
     if (ret)
         g_warning ("failed to schedule a page flip: %s", strerror (errno));
@@ -1448,7 +1435,7 @@ on_export_buffer_resource (void *data, struct wl_resource *buffer_resource)
     struct buffer_object *buffer = drm_buffer_for_resource (buffer_resource);
     if (buffer) {
         buffer->export.resource = buffer_resource;
-        drm_commit_buffer (buffer);
+        drm_commit_buffer(data, buffer);
         return;
     }
 
@@ -1466,7 +1453,7 @@ on_export_buffer_resource (void *data, struct wl_resource *buffer_resource)
     buffer = drm_create_buffer_for_bo (bo, buffer_resource, width, height, format);
     if (buffer) {
         buffer->export.resource = buffer_resource;
-        drm_commit_buffer (buffer);
+        drm_commit_buffer(data, buffer);
     }
 }
 
@@ -1476,7 +1463,7 @@ on_export_dmabuf_resource (void *data, struct wpe_view_backend_exportable_fdo_dm
     struct buffer_object *buffer = drm_buffer_for_resource (dmabuf_resource->buffer_resource);
     if (buffer) {
         buffer->export.resource = dmabuf_resource->buffer_resource;
-        drm_commit_buffer (buffer);
+        drm_commit_buffer(data, buffer);
         return;
     }
 
@@ -1505,7 +1492,7 @@ on_export_dmabuf_resource (void *data, struct wpe_view_backend_exportable_fdo_dm
                                        dmabuf_resource->format);
     if (buffer) {
         buffer->export.resource = dmabuf_resource->buffer_resource;
-        drm_commit_buffer (buffer);
+        drm_commit_buffer(data, buffer);
     }
 }
 
@@ -1521,7 +1508,7 @@ on_export_shm_buffer (void* data, struct wpe_fdo_shm_exported_buffer *exported_b
         drm_copy_shm_buffer_into_bo (exported_shm_buffer, buffer->bo);
 
         buffer->export.shm_buffer = exported_buffer;
-        drm_commit_buffer (buffer);
+        drm_commit_buffer(data, buffer);
         return;
     }
 
@@ -1530,7 +1517,7 @@ on_export_shm_buffer (void* data, struct wpe_fdo_shm_exported_buffer *exported_b
         drm_copy_shm_buffer_into_bo (exported_shm_buffer, buffer->bo);
 
         buffer->export.shm_buffer = exported_buffer;
-        drm_commit_buffer (buffer);
+        drm_commit_buffer(data, buffer);
     }
 }
 #endif
@@ -1557,7 +1544,9 @@ cog_drm_platform_setup(CogPlatform *platform, CogShell *shell, const char *param
     g_assert (platform);
     g_return_val_if_fail (COG_IS_SHELL (shell), FALSE);
 
-    init_config (shell);
+    CogDrmPlatform *self = COG_DRM_PLATFORM(platform);
+
+    init_config(self, shell);
 
     if (!wpe_loader_init ("libWPEBackend-fdo-1.0.so")) {
         g_set_error_literal (error,
@@ -1567,7 +1556,7 @@ cog_drm_platform_setup(CogPlatform *platform, CogShell *shell, const char *param
         return FALSE;
     }
 
-    if (!init_drm ()) {
+    if (!init_drm(self)) {
         g_set_error_literal (error,
                              COG_PLATFORM_WPE_ERROR,
                              COG_PLATFORM_WPE_ERROR_INIT,
@@ -1644,10 +1633,12 @@ cog_drm_platform_get_view_backend(CogPlatform *platform, WebKitWebView *related_
 #endif
     };
 
-    wpe_host_data.exportable = wpe_view_backend_exportable_fdo_create (&exportable_client,
-                                                                       NULL,
-                                                                       drm_data.width / drm_data.device_scale,
-                                                                       drm_data.height / drm_data.device_scale);
+    CogDrmPlatform *self = COG_DRM_PLATFORM(platform);
+
+    wpe_host_data.exportable = wpe_view_backend_exportable_fdo_create(&exportable_client,
+                                                                      platform,
+                                                                      drm_data.width / self->device_scale_factor,
+                                                                      drm_data.height / self->device_scale_factor);
     g_assert (wpe_host_data.exportable);
 
     wpe_view_data.backend = wpe_view_backend_exportable_fdo_get_view_backend (wpe_host_data.exportable);
@@ -1665,19 +1656,91 @@ cog_drm_platform_get_view_backend(CogPlatform *platform, WebKitWebView *related_
 static void
 cog_drm_platform_init_web_view(CogPlatform *platform, WebKitWebView *view)
 {
+    CogDrmPlatform *self = COG_DRM_PLATFORM(platform);
     wpe_view_backend_dispatch_set_device_scale_factor (wpe_view_data.backend,
-                                                       drm_data.device_scale);
+                                                       self->device_scale_factor);
+}
+
+static void
+cog_drm_platform_get_property(GObject *object, unsigned prop_id, GValue *value, GParamSpec *pspec)
+{
+    CogDrmPlatform *self = COG_DRM_PLATFORM(object);
+    switch (prop_id) {
+        case PROP_ATOMIC_MODE_SETTING:
+            g_value_set_boolean(value, self->atomic_mode_setting);
+            break;
+        case PROP_DEVICE_SCALE_FACTOR:
+            g_value_set_float(value, self->device_scale_factor);
+            break;
+        default:
+            G_OBJECT_WARN_INVALID_PROPERTY_ID(object, prop_id, pspec);
+    }
+}
+
+static void
+cog_drm_platform_set_property(GObject *object, unsigned prop_id, const GValue *value, GParamSpec *pspec)
+{
+    CogDrmPlatform *self = COG_DRM_PLATFORM(object);
+    switch (prop_id) {
+        case PROP_ATOMIC_MODE_SETTING:
+            self->atomic_mode_setting = g_value_get_boolean(value);
+            break;
+        case PROP_DEVICE_SCALE_FACTOR:
+            self->device_scale_factor = g_value_get_float(value);
+            break;
+        default:
+            G_OBJECT_WARN_INVALID_PROPERTY_ID(object, prop_id, pspec);
+    }
 }
 
 static void
 cog_drm_platform_class_init(CogDrmPlatformClass *klass)
 {
+    GObjectClass *object_class = G_OBJECT_CLASS(klass);
+    object_class->get_property = cog_drm_platform_get_property;
+    object_class->set_property = cog_drm_platform_set_property;
+
     CogPlatformClass *platform_class = COG_PLATFORM_CLASS(klass);
     platform_class->is_supported = cog_drm_platform_is_supported;
     platform_class->setup = cog_drm_platform_setup;
     platform_class->teardown = cog_drm_platform_teardown;
     platform_class->get_view_backend = cog_drm_platform_get_view_backend;
     platform_class->init_web_view = cog_drm_platform_init_web_view;
+
+    /**
+     * CogDrmPlatform.atomic-mode-setting:
+     *
+     * Whether to use DRM/KMS atomic mode setting.
+     *
+     * Even if initially enabled, if the driver reports the feature as not
+     * supported the setting will be disabled automatically. Explicitly
+     * disabling atomic mode setting is rarely needed, but might fix issues
+     * with certain drivers.
+     *
+     * Since: 0.12
+     */
+    s_properties[PROP_ATOMIC_MODE_SETTING] =
+        g_param_spec_boolean("atomic-mode-setting",
+                             "Atomic mode setting",
+                             "Use DRM/KMS atomic mode setting",
+                             TRUE,
+                             G_PARAM_READWRITE |
+                             G_PARAM_STATIC_STRINGS);
+
+    /**
+     * CogDrmPlatform.device-scale-factor:
+     *
+     * Scaling factor applied to the output device.
+     */
+    s_properties[PROP_DEVICE_SCALE_FACTOR] =
+        g_param_spec_float("device-scale-factor",
+                           "Device scale factor",
+                           "Output device scaling factor",
+                           0.25f, 5.0f, 1.0f,
+                           G_PARAM_READWRITE |
+                           G_PARAM_STATIC_STRINGS);
+
+    g_object_class_install_properties(object_class, N_PROPERTIES, s_properties);
 }
 
 static void
